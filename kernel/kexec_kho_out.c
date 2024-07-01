@@ -363,7 +363,7 @@ static int kho_serialize(void)
 
 out:
 	if (err) {
-		pr_err("kho failed to serialize state: %d", err);
+		pr_err("kho failed to serialize state: %d\n", err);
 		kho_abort();
 	}
 	return err;
