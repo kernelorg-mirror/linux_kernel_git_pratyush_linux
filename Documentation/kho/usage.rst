@@ -51,7 +51,7 @@ Abort a KHO exec
 
 You can move the system out of KHO active phase again by calling ::
 
-  $ echo 1 > /sys/kernel/kho/active
+  $ echo 0 > /sys/kernel/kho/active
 
 After this command, the KHO device tree is no longer available in
 ``/sys/kernel/kho/dt``.
