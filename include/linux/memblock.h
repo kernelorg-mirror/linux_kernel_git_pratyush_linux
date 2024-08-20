@@ -607,9 +607,11 @@ static inline void memtest_report_meminfo(struct seq_file *m) { }
 #ifdef CONFIG_MEMBLOCK_SCRATCH
 void memblock_set_scratch_only(void);
 void memblock_clear_scratch_only(void);
+bool memblock_is_range_scratch(phys_addr_t start, phys_addr_t end);
 #else
 static inline void memblock_set_scratch_only(void) { }
 static inline void memblock_clear_scratch_only(void) { }
+bool memblock_is_range_scratch(phys_addr_t start, phys_addr_t end) { return false; }
 #endif
 
 #endif /* _LINUX_MEMBLOCK_H */

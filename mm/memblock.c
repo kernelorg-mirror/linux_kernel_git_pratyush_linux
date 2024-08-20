@@ -1099,6 +1099,20 @@ int __init_memblock memblock_clear_scratch(phys_addr_t base, phys_addr_t size)
 	return memblock_setclr_flag(&memblock.memory, base, size, 0, MEMBLOCK_SCRATCH);
 }
 
+bool __init_memblock memblock_is_range_scratch(phys_addr_t start, phys_addr_t end)
+{
+	phys_addr_t rstart, rend;
+	u64 i;
+
+	__for_each_mem_range(i, &memblock.memory, NULL, NUMA_NO_NODE,
+			     MEMBLOCK_SCRATCH, &rstart, &rend, NULL) {
+		if (memblock_addrs_overlap(start, end, rstart, rend))
+			return true;
+	}
+
+	return false;
+}
+
 static bool should_skip_region(struct memblock_type *type,
 			       struct memblock_region *m,
 			       int nid, int flags)

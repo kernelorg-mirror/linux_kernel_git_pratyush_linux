@@ -681,6 +681,10 @@ defer_init(int nid, unsigned long pfn, unsigned long end_pfn)
 	if (end_pfn < pgdat_end_pfn(NODE_DATA(nid)))
 		return false;
 
+	/* Always populate memblock scratch pages. */
+	if (memblock_is_range_scratch(PFN_PHYS(pfn), PFN_PHYS(end_pfn)))
+		return false;
+
 	if (NODE_DATA(nid)->first_deferred_pfn != ULONG_MAX)
 		return true;
 
