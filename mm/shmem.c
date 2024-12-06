@@ -121,6 +121,8 @@ struct shmem_options {
 	int huge;
 	int seen;
 	bool noswap;
+	bool kho;
+	char *kho_name;
 	unsigned short quota_types;
 	struct shmem_quota_limits qlimits;
 #define SHMEM_SEEN_BLOCKS 1
@@ -129,6 +131,7 @@ struct shmem_options {
 #define SHMEM_SEEN_INUMS 8
 #define SHMEM_SEEN_NOSWAP 16
 #define SHMEM_SEEN_QUOTA 32
+#define SHMEM_SEEN_KHO 64
 };
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
@@ -4244,6 +4247,7 @@ enum shmem_param {
 	Opt_inode32,
 	Opt_inode64,
 	Opt_noswap,
+	Opt_kho,
 	Opt_quota,
 	Opt_usrquota,
 	Opt_grpquota,
@@ -4273,6 +4277,9 @@ const struct fs_parameter_spec shmem_fs_parameters[] = {
 	fsparam_flag  ("inode32",	Opt_inode32),
 	fsparam_flag  ("inode64",	Opt_inode64),
 	fsparam_flag  ("noswap",	Opt_noswap),
+#ifdef CONFIG_TMPFS_KHO
+	fsparam_string("kho",		Opt_kho),
+#endif
 #ifdef CONFIG_TMPFS_QUOTA
 	fsparam_flag  ("quota",		Opt_quota),
 	fsparam_flag  ("usrquota",	Opt_usrquota),
@@ -4380,6 +4387,22 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
 		}
 		ctx->full_inums = true;
 		ctx->seen |= SHMEM_SEEN_INUMS;
+		break;
+	case Opt_kho:
+		if ((fc->user_ns != &init_user_ns) || !capable(CAP_SYS_ADMIN)) {
+			return invalfc(fc,
+				       "Enabling Kexec Handover in unprivileged tmpfs mounts unsupported");
+		}
+		/*
+		 * Handling swapping is too complex for now. Leave it for later.
+		 */
+		ctx->noswap = true;
+		ctx->kho = true;
+		ctx->seen |= SHMEM_SEEN_KHO;
+		/* TODO: Should I put a limit on string length? */
+		ctx->kho_name = param->string;
+		/* Steal the string from the parameter. */
+		param->string = NULL;
 		break;
 	case Opt_noswap:
 		if ((fc->user_ns != &init_user_ns) || !capable(CAP_SYS_ADMIN)) {

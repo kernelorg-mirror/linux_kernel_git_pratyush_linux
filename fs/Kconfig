@@ -252,6 +252,16 @@ config TMPFS_QUOTA
 
 	  If unsure, say N.
 
+config TMPFS_KHO
+  bool "TMPFS Kexec Handover support"
+	depends on TMPFS && KEXEC_KHO
+	help
+	  Support persisting files over a kexec via Kexec Handover (KHO). Enabling
+	  this option does not automatically enable this persistence. See KHO
+	  documentation for more info on how to activate it.
+
+	  If unsure, say N.
+
 config ARCH_SUPPORTS_HUGETLBFS
 	def_bool n
 
