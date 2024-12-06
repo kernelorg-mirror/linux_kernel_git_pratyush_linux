@@ -17,6 +17,72 @@
 #define SHMEM_MAXQUOTAS 2
 #endif
 
+struct shmem_kho_block {
+	u64 start;
+};
+
+/*
+ * Dirents are stored in the blocks array. Total length becomes (2039 * 8) / (8
+ * + 256) == 61.
+ */
+#define SHMEM_DIRENT_MAX 61
+/*
+ * TODO: I have set the NAME_MAX to 254 instead of 255 to fit in type to the
+ * dirent without causing alignment problems. Common convention is to have 255
+ * so see if we can fit it in somehow while keeping NAME_MAX to 255.
+ */
+#define SHMEM_KHO_NAME_MAX 254
+
+struct shmem_kho_dirent {
+	u64 ino;
+	unsigned char type;
+	/* Including the NUL terminator. */
+	char name[SHMEM_KHO_NAME_MAX + 1];
+};
+
+#define SHMEM_KHO_NDENTS(i_size) ((i_size) / sizeof(struct shmem_kho_dirent))
+
+/*
+ * Stable version of the shmem inode.
+ *
+ * When using Kexec Handover (KHO), a stable inode format is needed that can be
+ * shared between different kernel versions. To avoid putting this burden on
+ * shmem_inode_info, a simpler, stable version of the inode is created here.
+ *
+ * Don't care about endianness here since the inode will always be used on the
+ * same machine.
+ *
+ * TODO: Alignment and packing of the structure.
+ */
+struct shmem_kho_inode {
+	u16 i_mode;
+	u16 __reserved; /* TODO: Use it for something else? */
+	u32 i_uid;
+	u32 i_gid;
+	u32 i_flags;
+	u32 i_fsflags;
+	u64 i_size;
+	u64 i_blocks; /* 1 block == 1 page */
+	s64 i_atime_sec;
+	s64 i_btime_sec;
+	s64 i_ctime_sec;
+	s64 i_mtime_sec;
+	u32 i_atime_nsec;
+	u32 i_btime_nsec;
+	u32 i_ctime_nsec;
+	u32 i_mtime_nsec;
+	u32 i_nlink;
+	u32 i_generation;
+	/* TODO: i_version? */
+	/* TODO: fallocend? */
+	/* TODO: Replace static blocks array with something smarter. */
+#define SHMEM_KHO_NBLOCKS 2036
+	union {
+		struct shmem_kho_block blocks[SHMEM_KHO_NBLOCKS];
+		struct shmem_kho_dirent dirents[SHMEM_DIRENT_MAX];
+	};
+};
+
 struct shmem_inode_info {
 	spinlock_t		lock;
 	unsigned int		seals;		/* shmem seals */
