@@ -138,6 +138,207 @@ static unsigned long huge_shmem_orders_inherit __read_mostly;
 static unsigned long huge_shmem_orders_within_size __read_mostly;
 #endif
 
+/*
+ * Super crude version of the slab allocator.
+ *
+ * TODO: Make slab cache KHO-able.
+ */
+#define SIMPLE_SLAB_BLOCKORDER	9 /* 2 MiB allocations */
+
+struct simple_slab_block {
+	struct list_head list;
+	void *base;
+};
+
+struct simple_slab {
+	struct list_head blocks;
+	unsigned long slabsize;
+	unsigned long nblocks;
+	struct mutex lock;
+	void *first_free;
+	void (*ctor)(void *object);
+};
+
+static struct simple_slab kho_inode_cache;
+
+static struct simple_slab_block *new_simple_slab_block(unsigned long slabsize)
+{
+	struct simple_slab_block *block;
+	void *base, **slot;
+
+	block = kmalloc(sizeof(*block), GFP_KERNEL);
+	if (!block)
+		return NULL;
+
+	base = (void *)__get_free_pages(GFP_KERNEL | __GFP_ZERO,
+					SIMPLE_SLAB_BLOCKORDER);
+	if (!base) {
+		kfree(block);
+		return NULL;
+	}
+
+	slot = base;
+	while ((void *)(slot + slabsize) <= base + (1 << (SIMPLE_SLAB_BLOCKORDER + PAGE_SHIFT))) {
+		*slot = slot + slabsize;
+		slot += slabsize;
+	}
+
+	/* NULL denotes end of list. */
+	*(slot - slabsize) = NULL;
+
+	block->base = base;
+	INIT_LIST_HEAD(&block->list);
+
+	return block;
+}
+
+static int init_simple_slab(struct simple_slab *slab, unsigned long slabsize)
+{
+	slabsize = max_t(unsigned long, slabsize, sizeof(void *));
+
+	mutex_init(&slab->lock);
+	INIT_LIST_HEAD(&slab->blocks);
+	slab->slabsize = slabsize;
+	slab->first_free = NULL;
+	slab->nblocks = 0;
+	return 0;
+}
+
+static void *alloc_simple_slab(struct simple_slab *slab)
+{
+	void *ret, *next;
+
+	mutex_lock(&slab->lock);
+
+	ret = slab->first_free;
+	if (!ret) {
+		struct simple_slab_block *block;
+
+		block = new_simple_slab_block(slab->slabsize);
+		if (!block)
+			goto out;
+
+		list_add_tail(&block->list, &slab->blocks);
+		slab->first_free = block->base;
+		slab->nblocks++;
+		ret = slab->first_free;
+	}
+
+	next = *(void **)ret;
+	slab->first_free = next;
+out:
+	mutex_unlock(&slab->lock);
+	return ret;
+}
+
+static void free_simple_slab(struct simple_slab *slab, void *ptr)
+{
+	if (!ptr)
+		return;
+
+	memset(ptr, 0, slab->slabsize);
+	mutex_lock(&slab->lock);
+	*(void **)ptr = slab->first_free;
+	slab->first_free = ptr;
+	/* TODO: No reclaim of empty blocks. */
+	mutex_unlock(&slab->lock);
+}
+
+static int kho_serialize_simple_slab(void *fdt, struct simple_slab *slab,
+				     const char *name)
+{
+	struct simple_slab_block *block;
+	struct kho_mem *mems, *cur;
+	unsigned long size;
+	int ret = 0;
+
+	size = slab->nblocks * sizeof(struct kho_mem);
+	mems = kvmalloc(size, GFP_KERNEL);
+	if (!mems)
+		return -ENOMEM;
+
+	ret |= fdt_begin_node(fdt, name);
+	ret |= fdt_property_string(fdt, "compatible", "simple-slab-v1");
+
+	cur = mems;
+
+	list_for_each_entry(block, &slab->blocks, list) {
+		cur->addr = virt_to_phys(block->base);
+		cur->len = (1 << (SIMPLE_SLAB_BLOCKORDER + PAGE_SHIFT));
+		cur++;
+	}
+
+	ret |= fdt_property(fdt, "mem", mems, size);
+	ret |= fdt_property_u64(fdt, "slabsize", slab->slabsize);
+	ret |= fdt_property_u64(fdt, "first-free", (u64)slab->first_free);
+	ret |= fdt_end_node(fdt);
+
+	kvfree(mems);
+
+	if (ret) {
+		pr_err("Failed to serialize simple slab '%s'\n", name);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int kho_deserialize_simple_slab(const void *fdt, int off,
+				       struct simple_slab *slab)
+{
+	int nblocks, i, len;
+	unsigned long slabsize;
+	void *first_free;
+	const void *prop;
+	const struct kho_mem *mems;
+
+	 mems = fdt_getprop(fdt, off, "mem", &len);
+	 if (!mems) {
+		 printk("Found no memory ranges to deserialize\n");
+		 return -EINVAL;
+	 }
+	 if (len % sizeof(*mems)) {
+		 printk("Found invalid memory range!\n");
+		 return -EINVAL;
+	 }
+
+	 nblocks = len / sizeof(*mems);
+
+	 prop = fdt_getprop(fdt, off, "slabsize", &len);
+	 if (!prop || len != sizeof(fdt64_t)) {
+		 printk("Invalid slabsize!\n");
+		 return -EINVAL;
+	 }
+	 slabsize = fdt64_to_cpu(*(fdt64_t *)prop);
+
+	 prop = fdt_getprop(fdt, off, "first-free", &len);
+	 if (!prop || len != sizeof(fdt64_t)) {
+		 printk("Invalid first-free!\n");
+		 return -EINVAL;
+	 }
+	 first_free = (void *)fdt64_to_cpu(*(fdt64_t *)prop);
+
+	 init_simple_slab(slab, slabsize);
+	 slab->nblocks = nblocks;
+	 slab->first_free = first_free;
+
+	 for (i = 0; i < nblocks; i++) {
+		 struct simple_slab_block *block;
+
+		 block = kmalloc(sizeof(*block), GFP_KERNEL);
+		 /* TODO: Leaks mem. */
+		 if (!block)
+			 return -ENOMEM;
+
+		 block->base = kho_claim_mem(&mems[i]);
+
+		 INIT_LIST_HEAD(&block->list);
+		 list_add_tail(&block->list, &slab->blocks);
+	 }
+
+	 return 0;
+}
+
 #ifdef CONFIG_TMPFS
 static unsigned long shmem_default_max_blocks(void)
 {
