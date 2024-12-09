@@ -515,6 +515,7 @@ static void shmem_inode_unacct_blocks(struct inode *inode, long pages)
 static const struct super_operations shmem_ops;
 static const struct address_space_operations shmem_aops;
 static const struct file_operations shmem_file_operations;
+static const struct file_operations shmem_kho_dir_operations;
 static const struct inode_operations shmem_inode_operations;
 static const struct inode_operations shmem_dir_inode_operations;
 static const struct inode_operations shmem_special_inode_operations;
@@ -3830,6 +3831,32 @@ static int shmem_statfs(struct dentry *dentry, struct kstatfs *buf)
 	return 0;
 }
 
+/* TODO: Should it co-exist with simple-offset or replace it? */
+static int shmem_kho_mknod(struct inode *dir, struct inode *inode,
+			   struct dentry *dentry, umode_t mode)
+{
+	struct shmem_kho_inode *dir_kho = SHMEM_I(dir)->kho_inode;
+	struct shmem_kho_dirent *dirent;
+
+	if (dentry->d_name.len > SHMEM_KHO_NAME_MAX)
+		return -ENAMETOOLONG;
+
+	if (SHMEM_KHO_NDENTS(dir_kho->i_size) > SHMEM_DIRENT_MAX)
+		return -ENOSPC;
+
+	dirent = &dir_kho->dirents[SHMEM_KHO_NDENTS(dir_kho->i_size)];
+	dirent->ino = inode->i_ino;
+	dirent->type = fs_umode_to_ftype(inode->i_mode);
+	strcpy(dirent->name, dentry->d_name.name);
+	dir_kho->i_size += sizeof(struct shmem_kho_dirent);
+
+	/* Match mtime and ctime changes from in-core inode. */
+	shmem_kho_inode_set_mtime(dir_kho, inode_get_mtime(dir));
+	shmem_kho_inode_set_ctime(dir_kho, inode_get_ctime(dir));
+
+	return 0;
+}
+
 /*
  * File creation. Allocate an inode, and we're done..
  */
@@ -3837,6 +3864,7 @@ static int
 shmem_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	    struct dentry *dentry, umode_t mode, dev_t dev)
 {
+	struct shmem_kho_inode *dir_kho_inode = SHMEM_I(dir)->kho_inode;
 	struct inode *inode;
 	int error;
 
@@ -3856,9 +3884,17 @@ shmem_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	if (error)
 		goto out_iput;
 
+	/* TODO: This should reflect size used by kho_inode? */
 	dir->i_size += BOGO_DIRENT_SIZE;
 	inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
 	inode_inc_iversion(dir);
+
+	if (dir_kho_inode) {
+		error = shmem_kho_mknod(dir, inode, dentry, mode);
+		if (error)
+			goto out_iput;
+	}
+
 	d_instantiate(dentry, inode);
 	dget(dentry); /* Extra count - pin the dentry in core */
 	return error;
@@ -3899,12 +3935,15 @@ out_iput:
 static int shmem_mkdir(struct mnt_idmap *idmap, struct inode *dir,
 		       struct dentry *dentry, umode_t mode)
 {
+	struct shmem_kho_inode *kho_inode = SHMEM_I(dir)->kho_inode;
 	int error;
 
 	error = shmem_mknod(idmap, dir, dentry, mode | S_IFDIR, 0);
 	if (error)
 		return error;
 	inc_nlink(dir);
+	if (kho_inode)
+		kho_inode->i_nlink++;
 	return 0;
 }
 
@@ -3912,6 +3951,58 @@ static int shmem_create(struct mnt_idmap *idmap, struct inode *dir,
 			struct dentry *dentry, umode_t mode, bool excl)
 {
 	return shmem_mknod(idmap, dir, dentry, mode | S_IFREG, 0);
+}
+
+static struct dentry *shmem_lookup(struct inode *dir, struct dentry *dentry,
+				   unsigned int flags)
+{
+	struct shmem_inode_info *info = SHMEM_I(dir);
+	struct shmem_kho_inode *kho_inode = info->kho_inode;
+	struct inode *inode = NULL;
+	struct dentry *new_dentry;
+	unsigned int i;
+
+	/*
+	 * TODO: Doing this in hot path is wasteful. Should probably create new
+	 * ops for KHO mounts.
+	 */
+	if (!SHMEM_SB(dir->i_sb)->kho_deser)
+		return simple_lookup(dir, dentry, flags);
+
+	if (WARN_ON_ONCE(!kho_inode))
+		return ERR_PTR(-EINVAL);
+
+	if (dentry->d_name.len > SHMEM_KHO_NAME_MAX)
+		return ERR_PTR(-ENAMETOOLONG);
+
+	for (i = 0; i < SHMEM_KHO_NDENTS(kho_inode->i_size); i++) {
+		struct shmem_kho_dirent *dirent = &kho_inode->dirents[i];
+
+		if (!strcmp(dentry->d_name.name, dirent->name)) {
+			inode = shmem_get_kho_inode(&nop_mnt_idmap, dir->i_sb,
+						    dir, VM_NORESERVE,
+						    dirent->ino);
+			if (IS_ERR(inode))
+				return ERR_CAST(inode);
+
+			break;
+		}
+	}
+
+	if (!inode)
+		return simple_lookup(inode, dentry, flags);
+
+	new_dentry = d_splice_alias(inode, dentry);
+	if (IS_ERR(new_dentry))
+		return new_dentry;
+
+	/* Extra count - pin the dentry in core */
+	if (new_dentry)
+		dget(new_dentry);
+	else
+		dget(dentry);
+
+	return new_dentry;
 }
 
 /*
@@ -3955,6 +4046,38 @@ out:
 	return ret;
 }
 
+static void shmem_kho_unlink(struct inode *dir, struct dentry *dentry)
+{
+	struct shmem_kho_inode *dir_kho = SHMEM_I(dir)->kho_inode;
+	const char *name = dentry->d_name.name;
+	unsigned int i, j, ndents;
+
+	if (WARN_ON_ONCE(dir_kho->i_size < sizeof(struct shmem_kho_dirent)))
+		return;
+
+	ndents = SHMEM_KHO_NDENTS(dir_kho->i_size);
+
+	for (i = 0; i < ndents; i++) {
+		struct shmem_kho_dirent *dirent = &dir_kho->dirents[i];
+
+		if (!strcmp(name, dirent->name))
+			break;
+	}
+
+	if (WARN_ONCE(i == ndents, "Failed to find dirent %s\n", name))
+		return;
+
+	for (j = i + 1; j < ndents; j++)
+		dir_kho->dirents[j - 1] = dir_kho->dirents[j];
+
+	dir_kho->i_size -= sizeof(struct shmem_kho_dirent);
+	dir_kho->i_nlink--;
+
+	/* Match mtime and ctime changes from in-core inode. */
+	shmem_kho_inode_set_ctime(dir_kho, inode_get_ctime(dir));
+	shmem_kho_inode_set_mtime(dir_kho, inode_get_mtime(dir));
+}
+
 static int shmem_unlink(struct inode *dir, struct dentry *dentry)
 {
 	struct inode *inode = d_inode(dentry);
@@ -3964,9 +4087,16 @@ static int shmem_unlink(struct inode *dir, struct dentry *dentry)
 
 	simple_offset_remove(shmem_get_offset_ctx(dir), dentry);
 
+	/* TODO: This should reflect size used by kho_inode? */
 	dir->i_size -= BOGO_DIRENT_SIZE;
 	inode_set_mtime_to_ts(dir,
 			      inode_set_ctime_to_ts(dir, inode_set_ctime_current(inode)));
+
+	if (SHMEM_I(dir)->kho_inode) {
+		shmem_kho_unlink(dir, dentry);
+		shmem_kho_inode_set_ctime(SHMEM_I(inode)->kho_inode, inode_get_ctime(inode));
+	}
+
 	inode_inc_iversion(dir);
 	drop_nlink(inode);
 	dput(dentry);	/* Undo the count from "create" - does all the work */
@@ -4161,6 +4291,36 @@ static const char *shmem_get_link(struct dentry *dentry, struct inode *inode,
 	}
 	set_delayed_call(done, shmem_put_link, folio);
 	return folio_address(folio);
+}
+
+/*
+ * TODO: Not sure I implemented the API correctly, especially with regards to
+ * rounding down pos. Revisit this and see how other file systems behave when
+ * seeking on a directory.
+ */
+static int shmem_kho_readdir(struct file *file, struct dir_context *ctx)
+{
+	struct inode *inode = file_inode(file);
+	struct shmem_kho_inode *kho_inode = SHMEM_I(inode)->kho_inode;
+	unsigned int i = ctx->pos / sizeof(struct shmem_kho_dirent);
+
+	if (WARN_RATELIMIT(!kho_inode, "KHO dir callback without KHO inode!"))
+		return -EINVAL;
+
+	if (i >= SHMEM_KHO_NDENTS(kho_inode->i_size))
+		return 0;
+
+	while (i < SHMEM_KHO_NDENTS(kho_inode->i_size)) {
+		struct shmem_kho_dirent *dirent = &kho_inode->dirents[i];
+		if (!dir_emit(ctx, dirent->name, strlen(dirent->name),
+			      dirent->ino, fs_ftype_to_dtype(dirent->type)))
+			return 0;
+
+		i++;
+		ctx->pos = i * sizeof(struct shmem_kho_dirent);
+	}
+
+	return 0;
 }
 
 #ifdef CONFIG_TMPFS_XATTR
@@ -5550,11 +5710,18 @@ static const struct inode_operations shmem_inode_operations = {
 #endif
 };
 
+static const struct file_operations shmem_kho_dir_operations = {
+	.llseek = generic_file_llseek,
+	.iterate_shared = shmem_kho_readdir,
+	.read = generic_read_dir,
+	.fsync = noop_fsync,
+};
+
 static const struct inode_operations shmem_dir_inode_operations = {
 #ifdef CONFIG_TMPFS
 	.getattr	= shmem_getattr,
 	.create		= shmem_create,
-	.lookup		= simple_lookup,
+	.lookup		= shmem_lookup,
 	.link		= shmem_link,
 	.unlink		= shmem_unlink,
 	.symlink	= shmem_symlink,
