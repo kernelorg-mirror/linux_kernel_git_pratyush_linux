@@ -1978,12 +1978,87 @@ static struct folio *shmem_alloc_folio(gfp_t gfp, int order,
 	return folio;
 }
 
+/*
+ * TODO: Figure out where I need to free the folios from. Perhaps not at all
+ * since those would get freed by page cache? In that case, should at least
+ * remove it from the blocks list.
+ */
+static struct folio *shmem_alloc_kho_folio(struct shmem_inode_info *info,
+					   pgoff_t index, enum sgp_type sgp,
+					   gfp_t gfp)
+{
+	struct shmem_kho_inode *kho_inode = info->kho_inode;
+	struct shmem_kho_block *block = &kho_inode->blocks[index];
+	struct folio *folio;
+
+	if (index >= SHMEM_KHO_NBLOCKS)
+		return ERR_PTR(-EFBIG);
+
+	/*
+	 * Should never reach here for a page already claimed from KHO since
+	 * then it would always exist in the page cache. So any block with
+	 * non-zero address should claim its memory back from KHO. All others
+	 * allocate new memory and fill it into the blocks list.
+	 *
+	 * TODO: Perhaps add a check to ensure that we don't re-claim the
+	 * memory.
+	 */
+	if (!block->start) {
+		/*
+		 * For reads, we only want to re-insert existing pages into
+		 * page cache, and do not want to allocate new ones.
+		 */
+		if (sgp <= SGP_NOALLOC)
+			return ERR_PTR(-ENOENT);
+
+		folio = shmem_alloc_folio(gfp, 0, info, index);
+		if (!folio)
+			return ERR_PTR(-ENOMEM);
+
+		/*
+		 * TODO: bitmap_set() takes unsigned int for bit index. So it
+		 * stops working if PFN is beyond UINT_MAX.
+		 */
+		bitmap_set(kho_pfn_bitmap, folio_pfn(folio), 1);
+		block->start = PFN_PHYS(folio_pfn(folio));
+	} else {
+		folio = virt_to_folio(phys_to_virt(block->start));
+		/*
+		 * TODO: This breaks falloc-ed folios since now they get marked
+		 * uptodate when they might not actually be zeroed out yet. Need
+		 * a way to distinguish falloc-ed folios.
+		 */
+		folio_mark_uptodate(folio);
+		folio_mark_dirty(folio);
+	}
+
+	return folio;
+}
+
+static void shmem_kho_free_block(struct shmem_kho_inode *kho_inode,
+				 pgoff_t index)
+{
+	struct shmem_kho_block *block = &kho_inode->blocks[index];
+
+	if (WARN_ON_ONCE(!block->start))
+		return;
+
+	/*
+	 * TODO: Should this care about sharing of folios? We might unset the
+	 * bit but the folio might be used by another inode?
+	 */
+	bitmap_clear(kho_pfn_bitmap, PHYS_PFN(block->start), 1);
+	block->start = 0;
+}
+
 static struct folio *shmem_alloc_and_add_folio(struct vm_fault *vmf,
 		gfp_t gfp, struct inode *inode, pgoff_t index,
-		struct mm_struct *fault_mm, unsigned long orders)
+		struct mm_struct *fault_mm, unsigned long orders,
+					       enum sgp_type sgp)
 {
 	struct address_space *mapping = inode->i_mapping;
 	struct shmem_inode_info *info = SHMEM_I(inode);
+	struct shmem_kho_inode *kho_inode = info->kho_inode;
 	struct vm_area_struct *vma = vmf ? vmf->vma : NULL;
 	unsigned long suitable_orders = 0;
 	struct folio *folio = NULL;
@@ -1993,7 +2068,13 @@ static struct folio *shmem_alloc_and_add_folio(struct vm_fault *vmf,
 	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
 		orders = 0;
 
-	if (orders > 0) {
+
+	if (kho_inode) {
+		folio = shmem_alloc_kho_folio(info, index, sgp, gfp);
+		if (IS_ERR(folio))
+			return folio;
+		pages = 1;
+	} else if (orders > 0) {
 		if (vma && vma_is_anon_shmem(vma)) {
 			suitable_orders = shmem_suitable_orders(inode, vmf,
 							mapping, index, orders);
@@ -2097,6 +2178,8 @@ allocated:
 	return folio;
 
 unlock:
+	if (kho_inode)
+		shmem_kho_free_block(kho_inode, index);
 	folio_unlock(folio);
 	folio_put(folio);
 	return ERR_PTR(error);
@@ -2337,7 +2420,7 @@ static int shmem_get_folio_gfp(struct inode *inode, pgoff_t index,
 	struct vm_area_struct *vma = vmf ? vmf->vma : NULL;
 	struct mm_struct *fault_mm;
 	struct folio *folio;
-	int error;
+	int error = 0;
 	bool alloced, huge;
 	unsigned long orders = 0;
 
@@ -2393,14 +2476,15 @@ repeat:
 	}
 
 	/*
-	 * SGP_READ: succeed on hole, with NULL folio, letting caller zero.
-	 * SGP_NOALLOC: fail on hole, with NULL folio, letting caller fail.
+	 * When kho_inode is present, we might need to get a page from the
+	 * kho_inode and add it to page cache. So can't always assume if no
+	 * folio is found in the page cache there is no backing page.
 	 */
-	*foliop = NULL;
-	if (sgp == SGP_READ)
-		return 0;
-	if (sgp == SGP_NOALLOC)
-		return -ENOENT;
+	if (SHMEM_I(inode)->kho_inode)
+		goto zero_order_alloc;
+
+	if (sgp <= SGP_NOALLOC)
+		goto nofolio;
 
 	/*
 	 * Fast cache lookup and swap lookup did not find it: allocate.
@@ -2425,7 +2509,7 @@ repeat:
 		huge_gfp = vma_thp_gfp_mask(vma);
 		huge_gfp = limit_gfp_mask(huge_gfp, gfp);
 		folio = shmem_alloc_and_add_folio(vmf, huge_gfp,
-				inode, index, fault_mm, orders);
+				inode, index, fault_mm, orders, sgp);
 		if (!IS_ERR(folio)) {
 			if (folio_test_pmd_mappable(folio))
 				count_vm_event(THP_FILE_ALLOC);
@@ -2438,11 +2522,15 @@ repeat:
 			goto repeat;
 	}
 
-	folio = shmem_alloc_and_add_folio(vmf, gfp, inode, index, fault_mm, 0);
+zero_order_alloc:
+	folio = shmem_alloc_and_add_folio(vmf, gfp, inode, index, fault_mm, 0,
+					  sgp);
 	if (IS_ERR(folio)) {
 		error = PTR_ERR(folio);
 		if (error == -EEXIST)
 			goto repeat;
+		else if (error == -ENOENT && sgp <= SGP_NOALLOC)
+			goto nofolio;
 		folio = NULL;
 		goto unlock;
 	}
@@ -2502,6 +2590,21 @@ clear:
 out:
 	*foliop = folio;
 	return 0;
+
+/* Should only get here when sgp <= SGP_NOALLOC. */
+nofolio:
+	/*
+	 * SGP_READ: succeed on hole, with NULL folio, letting caller zero.
+	 * SGP_NOALLOC: fail on hole, with NULL folio, letting caller fail.
+	 */
+	*foliop = NULL;
+	if (sgp == SGP_READ)
+		return 0;
+	if (sgp == SGP_NOALLOC)
+		return -ENOENT;
+
+	WARN_RATELIMIT(true, "Should not get here with SGP %d!\n", sgp);
+	error = -EINVAL;
 
 	/*
 	 * Error recovery.
@@ -3335,9 +3438,19 @@ shmem_write_end(struct file *file, struct address_space *mapping,
 {
 	struct folio *folio = page_folio(page);
 	struct inode *inode = mapping->host;
+	struct shmem_kho_inode *kho_inode = SHMEM_I(inode)->kho_inode;
 
-	if (pos + copied > inode->i_size)
+	if (pos + copied > inode->i_size) {
 		i_size_write(inode, pos + copied);
+
+		/*
+		 * TODO: This is racy with other size updates. Do it like we do
+		 * for inode->i_size.
+		 */
+		if (kho_inode)
+			kho_inode->i_size = inode->i_size;
+
+	}
 
 	if (!folio_test_uptodate(folio)) {
 		if (copied < folio_size(folio)) {
@@ -3352,6 +3465,23 @@ shmem_write_end(struct file *file, struct address_space *mapping,
 	folio_put(folio);
 
 	return copied;
+}
+
+/* TODO: Remove it from the path of non-KHO inodes. */
+static void shmem_invalidate_folio(struct folio *folio, size_t offset,
+				   size_t len)
+{
+	struct shmem_kho_inode *kho_inode = SHMEM_I(folio->mapping->host)->kho_inode;
+
+	if (!kho_inode)
+		return;
+
+	if (len != folio_size(folio)) {
+		printk("Do not know how to handle partial folios yet\n");
+		return;
+	}
+
+	shmem_kho_free_block(kho_inode, folio->index);
 }
 
 static ssize_t shmem_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
@@ -5682,6 +5812,7 @@ static const struct address_space_operations shmem_aops = {
 	.migrate_folio	= migrate_folio,
 #endif
 	.error_remove_folio = shmem_error_remove_folio,
+	.invalidate_folio = shmem_invalidate_folio,
 };
 
 static const struct file_operations shmem_file_operations = {
