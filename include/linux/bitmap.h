@@ -131,9 +131,12 @@ struct device;
  */
 unsigned long *bitmap_alloc(unsigned int nbits, gfp_t flags);
 unsigned long *bitmap_zalloc(unsigned int nbits, gfp_t flags);
+unsigned long *bitmap_kvalloc(unsigned int nbits, gfp_t flags);
+unsigned long *bitmap_kvzalloc(unsigned int nbits, gfp_t flags);
 unsigned long *bitmap_alloc_node(unsigned int nbits, gfp_t flags, int node);
 unsigned long *bitmap_zalloc_node(unsigned int nbits, gfp_t flags, int node);
 void bitmap_free(const unsigned long *bitmap);
+void bitmap_kvfree(const unsigned long *bitmap);
 
 DEFINE_FREE(bitmap, unsigned long *, if (_T) bitmap_free(_T))
 

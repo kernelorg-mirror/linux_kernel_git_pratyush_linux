@@ -727,6 +727,19 @@ unsigned long *bitmap_zalloc(unsigned int nbits, gfp_t flags)
 }
 EXPORT_SYMBOL(bitmap_zalloc);
 
+unsigned long *bitmap_kvalloc(unsigned int nbits, gfp_t flags)
+{
+	return kvmalloc_array(BITS_TO_LONGS(nbits), sizeof(unsigned long),
+			      flags);
+}
+EXPORT_SYMBOL(bitmap_kvalloc);
+
+unsigned long *bitmap_kvzalloc(unsigned int nbits, gfp_t flags)
+{
+	return bitmap_kvalloc(nbits, flags | __GFP_ZERO);
+}
+EXPORT_SYMBOL(bitmap_kvzalloc);
+
 unsigned long *bitmap_alloc_node(unsigned int nbits, gfp_t flags, int node)
 {
 	return kmalloc_array_node(BITS_TO_LONGS(nbits), sizeof(unsigned long),
@@ -745,6 +758,12 @@ void bitmap_free(const unsigned long *bitmap)
 	kfree(bitmap);
 }
 EXPORT_SYMBOL(bitmap_free);
+
+void bitmap_kvfree(const unsigned long *bitmap)
+{
+	kvfree(bitmap);
+}
+EXPORT_SYMBOL(bitmap_kvfree);
 
 static void devm_bitmap_free(void *data)
 {
