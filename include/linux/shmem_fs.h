@@ -105,6 +105,7 @@ struct shmem_inode_info {
 #ifdef CONFIG_TMPFS_QUOTA
 	struct dquot __rcu	*i_dquot[MAXQUOTAS];
 #endif
+	struct shmem_kho_inode *kho_inode;
 	struct inode		vfs_inode;
 };
 
@@ -130,9 +131,15 @@ struct shmem_sb_info {
 	unsigned char huge;	    /* Whether to try for hugepages */
 	kuid_t uid;		    /* Mount uid for root directory */
 	kgid_t gid;		    /* Mount gid for root directory */
-	bool full_inums;	    /* If i_ino should be uint or ino_t */
-	bool noswap;		    /* ignores VM reclaim / swap requests */
+	bool full_inums:1;	    /* If i_ino should be uint or ino_t */
+	bool noswap:1;		    /* ignores VM reclaim / swap requests */
+	bool kho:1;		    /* Kexec persistence via KHO. */
+	bool kho_deser:1;	    /* TODO: Hacky way to represent if we
+				     * should deserialize inodes. Look for
+				     * clearner ways. */
 	ino_t next_ino;		    /* The next per-sb inode number to use */
+	/* TODO: Make kho_name same as kho both here and in shmem_sb_info? */
+	char *kho_name;
 	ino_t __percpu *ino_batch;  /* The next per-cpu inode number to use */
 	struct mempolicy *mpol;     /* default memory policy for mappings */
 	spinlock_t shrinklist_lock;   /* Protects shrinklist */

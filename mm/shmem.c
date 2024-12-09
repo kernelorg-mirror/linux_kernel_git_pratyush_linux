@@ -40,6 +40,7 @@
 #include <linux/fs_parser.h>
 #include <linux/swapfile.h>
 #include <linux/iversion.h>
+#include <linux/kexec.h>
 #include "swap.h"
 
 static struct vfsmount *shm_mnt __ro_after_init;
@@ -133,6 +134,25 @@ struct shmem_options {
 #define SHMEM_SEEN_QUOTA 32
 #define SHMEM_SEEN_KHO 64
 };
+
+static struct mutex kho_deser_lock;
+static struct list_head kho_serialized_sblist;
+
+/*
+ * This bitmap is used to track which pages are used for files or directories
+ * on a KHO mount and must be preserved at KHO time.
+ */
+static unsigned long *kho_pfn_bitmap;
+static unsigned int kho_pfn_nbits;
+
+/* TODO: Maybe there is a better way to do this. */
+struct shmem_serialized_superblock {
+	struct list_head list;
+	const char *name;
+	int nodeoff;
+};
+
+static void shmem_free_in_core_inode(struct inode *inode);
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 static unsigned long huge_shmem_orders_always __read_mostly;
@@ -340,6 +360,34 @@ static int kho_deserialize_simple_slab(const void *fdt, int off,
 	 }
 
 	 return 0;
+}
+
+static void shmem_kho_inode_set_atime(struct shmem_kho_inode *kho_inode,
+				      struct timespec64 ts)
+{
+	kho_inode->i_atime_sec = ts.tv_sec;
+	kho_inode->i_atime_nsec = ts.tv_nsec;
+}
+
+static void shmem_kho_inode_set_btime(struct shmem_kho_inode *kho_inode,
+				      struct timespec64 ts)
+{
+	kho_inode->i_btime_sec = ts.tv_sec;
+	kho_inode->i_btime_nsec = ts.tv_nsec;
+}
+
+static void shmem_kho_inode_set_ctime(struct shmem_kho_inode *kho_inode,
+				      struct timespec64 ts)
+{
+	kho_inode->i_ctime_sec = ts.tv_sec;
+	kho_inode->i_ctime_nsec = ts.tv_nsec;
+}
+
+static void shmem_kho_inode_set_mtime(struct shmem_kho_inode *kho_inode,
+				      struct timespec64 ts)
+{
+	kho_inode->i_mtime_sec = ts.tv_sec;
+	kho_inode->i_mtime_nsec = ts.tv_nsec;
 }
 
 #ifdef CONFIG_TMPFS
@@ -2844,43 +2892,16 @@ static struct offset_ctx *shmem_get_offset_ctx(struct inode *inode)
 	return &SHMEM_I(inode)->dir_offsets;
 }
 
-static struct inode *__shmem_get_inode(struct mnt_idmap *idmap,
-					     struct super_block *sb,
-					     struct inode *dir, umode_t mode,
-					     dev_t dev, unsigned long flags)
+static void __shmem_init_inode_common(struct super_block *sb, struct inode *inode,
+				      unsigned long flags)
 {
-	struct inode *inode;
-	struct shmem_inode_info *info;
+	struct shmem_inode_info *info = SHMEM_I(inode);
 	struct shmem_sb_info *sbinfo = SHMEM_SB(sb);
-	ino_t ino;
-	int err;
 
-	err = shmem_reserve_inode(sb, &ino);
-	if (err)
-		return ERR_PTR(err);
-
-	inode = new_inode(sb);
-	if (!inode) {
-		shmem_free_inode(sb, 0);
-		return ERR_PTR(-ENOSPC);
-	}
-
-	inode->i_ino = ino;
-	inode_init_owner(idmap, inode, dir, mode);
-	inode->i_blocks = 0;
-	simple_inode_init_ts(inode);
-	inode->i_generation = get_random_u32();
-	info = SHMEM_I(inode);
-	memset(info, 0, (char *)inode - (char *)info);
 	spin_lock_init(&info->lock);
 	atomic_set(&info->stop_eviction, 0);
 	info->seals = F_SEAL_SEAL;
 	info->flags = flags & VM_NORESERVE;
-	info->i_crtime = inode_get_mtime(inode);
-	info->fsflags = (dir == NULL) ? 0 :
-		SHMEM_I(dir)->fsflags & SHMEM_FL_INHERITED;
-	if (info->fsflags)
-		shmem_set_inode_flags(inode, info->fsflags);
 	INIT_LIST_HEAD(&info->shrinklist);
 	INIT_LIST_HEAD(&info->swaplist);
 	simple_xattrs_init(&info->xattrs);
@@ -2888,6 +2909,82 @@ static struct inode *__shmem_get_inode(struct mnt_idmap *idmap,
 	if (sbinfo->noswap)
 		mapping_set_unevictable(inode->i_mapping);
 	mapping_set_large_folios(inode->i_mapping);
+
+	lockdep_annotate_inode_mutex_key(inode);
+}
+
+static struct inode *__shmem_get_inode(struct mnt_idmap *idmap,
+					     struct super_block *sb,
+					     struct inode *dir, umode_t mode,
+					     dev_t dev, unsigned long flags)
+{
+	struct inode *inode;
+	struct shmem_inode_info *info;
+	struct shmem_kho_inode *kho_inode = NULL;
+	struct shmem_sb_info *sbinfo = SHMEM_SB(sb);
+	ino_t ino;
+	int err;
+
+	/*
+	 * For KHO mounts, the inode number is assigned based on where the KHO
+	 * inode is allocated. That can only be done after allocation of the
+	 * inode. So skip inode reservation here.
+	 *
+	 * TODO: See if the logic can be cleaned up. Also, this hits performance
+	 * in hot(?) path. Can we make it faster? Also, we skip all the lowmem
+	 * usage checks as well.
+	 */
+	if (sbinfo->kho) {
+		kho_inode = alloc_simple_slab(&kho_inode_cache);
+		if (!kho_inode)
+			return ERR_PTR(-ENOMEM);
+
+		/*
+		 * We need a unique inode number for the KHO inode that can be
+		 * used across different kernel versions and can be used to
+		 * quickly and uniquely get the inode. For regular on-disk file
+		 * systems, that is usually calculated based on the inode's
+		 * location on disk.
+		 *
+		 * Do something similar here, except it is even more simpler;
+		 * just take the address in memory of the inode as its inode
+		 * number. This lets inodes to be quickly re-initialized after
+		 * KHO. They will stay in the same place since KHO makes sure of
+		 * that.
+		 *
+		 * TODO: This leaks the address of kernel objects to userspace.
+		 * That has security problems. Come up with a better inode
+		 * numbering scheme.
+		 */
+		ino = (unsigned long)kho_inode;
+	} else {
+		err = shmem_reserve_inode(sb, &ino);
+		if (err)
+			return ERR_PTR(err);
+	}
+
+	inode = new_inode(sb);
+	if (!inode) {
+		free_simple_slab(&kho_inode_cache, kho_inode);
+		shmem_free_inode(sb, 0);
+		return ERR_PTR(-ENOSPC);
+	}
+
+	info = SHMEM_I(inode);
+	memset(info, 0, (char *)&info->vfs_inode - (char *)info);
+	info->kho_inode = kho_inode;
+	inode->i_ino = ino;
+
+	__shmem_init_inode_common(sb, inode, flags);
+	inode_init_owner(idmap, inode, dir, mode);
+	inode->i_blocks = 0;
+	simple_inode_init_ts(inode);
+	inode->i_generation = get_random_u32();
+	info->i_crtime = inode_get_mtime(inode);
+	info->fsflags = (dir == NULL) ? 0 :
+		SHMEM_I(dir)->fsflags & SHMEM_FL_INHERITED;
+	if (info->fsflags)
+		shmem_set_inode_flags(inode, info->fsflags);
 
 	switch (mode & S_IFMT) {
 	default:
@@ -2918,7 +3015,38 @@ static struct inode *__shmem_get_inode(struct mnt_idmap *idmap,
 		break;
 	}
 
-	lockdep_annotate_inode_mutex_key(inode);
+	/* Initialize KHO inode based on the in-core inode. */
+	if (kho_inode) {
+		kho_inode->i_mode = inode->i_mode;
+		kho_inode->i_gid = __kgid_val(inode->i_gid);
+		kho_inode->i_uid = __kuid_val(inode->i_uid);
+		kho_inode->i_flags = inode->i_flags;
+		kho_inode->i_fsflags = info->fsflags;
+		kho_inode->i_blocks = inode->i_blocks;
+
+		shmem_kho_inode_set_atime(kho_inode, inode_get_atime(inode));
+		shmem_kho_inode_set_btime(kho_inode, info->i_crtime);
+		shmem_kho_inode_set_ctime(kho_inode, inode_get_ctime(inode));
+		shmem_kho_inode_set_mtime(kho_inode, inode_get_mtime(inode));
+
+		kho_inode->i_nlink = inode->i_nlink;
+		kho_inode->i_generation = inode->i_generation;
+
+		/*
+		 * An directory should always have an entry pointing to itself.
+		 * Add it here.
+		 */
+		if ((mode & S_IFMT) == S_IFDIR) {
+			struct shmem_kho_dirent *dirent = kho_inode->dirents;
+			dirent->ino = inode->i_ino;
+			dirent->type = FT_DIR;
+			strcpy(dirent->name, ".");
+			kho_inode->i_size = sizeof(struct shmem_kho_dirent);
+		} else {
+			kho_inode->i_size = 0;
+		}
+	}
+
 	return inode;
 }
 
@@ -2951,6 +3079,91 @@ errout:
 	return ERR_PTR(err);
 }
 #else
+static inline struct inode *shmem_get_kho_inode(struct mnt_idmap *idmap,
+						struct super_block *sb,
+						struct inode *dir,
+						unsigned long flags,
+						unsigned long ino)
+{
+	struct shmem_kho_inode *kho_inode;
+	struct shmem_inode_info *info;
+	struct inode *inode;
+	umode_t mode;
+
+	/* TODO: Here again, no lowmem usage checks. */
+	kho_inode = (struct shmem_kho_inode *)ino;
+
+	inode = new_inode(sb);
+	if (!inode) {
+		/*
+		 * Don't free the KHO inode. Leave it around in case another
+		 * attempt is made later to get the inode that succeeds.
+		 */
+		shmem_free_inode(sb, 0);
+		return ERR_PTR(-ENOSPC);
+	}
+
+	info = SHMEM_I(inode);
+	memset(info, 0, (char *)&info->vfs_inode - (char *)info);
+	info->kho_inode = kho_inode;
+
+	__shmem_init_inode_common(sb, inode, flags);
+
+	mode = kho_inode->i_mode;
+
+	inode->i_ino = ino;
+	inode->i_mode = mode;
+	i_uid_write(inode, kho_inode->i_uid);
+	i_gid_write(inode, kho_inode->i_gid);
+	inode->i_flags = kho_inode->i_flags;
+	inode->i_blocks = kho_inode->i_blocks;
+	inode->i_atime_sec = kho_inode->i_atime_sec;
+	inode->i_mtime_sec = kho_inode->i_mtime_sec;
+	inode->i_atime_nsec = kho_inode->i_atime_nsec;
+	inode->i_mtime_nsec = kho_inode->i_mtime_nsec;
+	set_nlink(inode, kho_inode->i_nlink);
+	inode->i_generation = kho_inode->i_generation;
+
+	info->fsflags = kho_inode->i_fsflags;
+	info->i_crtime.tv_sec = kho_inode->i_btime_sec;
+	info->i_crtime.tv_nsec = kho_inode->i_btime_nsec;
+
+	switch (mode & S_IFMT) {
+	case S_IFREG:
+		inode->i_size = kho_inode->i_size;
+		mapping_set_release_always(inode->i_mapping);
+		inode->i_mapping->a_ops = &shmem_aops;
+		inode->i_op = &shmem_inode_operations;
+		inode->i_fop = &shmem_file_operations;
+		mpol_shared_policy_init(&info->policy,
+					 shmem_get_sbmpol(SHMEM_SB(sb)));
+		break;
+	case S_IFDIR:
+		/*
+		 * HACK: This matches up with what would happen on a fresh
+		 * mount. Initially, the inode has 2 * BOGO_DIRENT_SIZE due to
+		 * '.' and '..', and then each dirent adds another
+		 * BOGO_DIRENT_SIZE.
+		 *
+		 * TODO: Calculate in-core inode size properly.
+		 */
+		inode->i_size = 2 * BOGO_DIRENT_SIZE +
+			(SHMEM_KHO_NDENTS(kho_inode->i_size) * BOGO_DIRENT_SIZE);
+		inode->i_op = &shmem_dir_inode_operations;
+		inode->i_fop = &shmem_kho_dir_operations;
+		simple_offset_init(shmem_get_offset_ctx(inode));
+		break;
+	default:
+		pr_err("Inode mode 0%o not supported!\n", (mode & S_IFMT));
+		free_simple_slab(&kho_inode_cache, kho_inode);
+		shmem_free_inode(sb, 0);
+		shmem_free_in_core_inode(inode);
+		return ERR_PTR(-EOPNOTSUPP);
+	}
+
+	return inode;
+}
+
 static inline struct inode *shmem_get_inode(struct mnt_idmap *idmap,
 				     struct super_block *sb, struct inode *dir,
 				     umode_t mode, dev_t dev, unsigned long flags)
@@ -4691,6 +4904,372 @@ static int shmem_show_options(struct seq_file *seq, struct dentry *root)
 
 #endif /* CONFIG_TMPFS */
 
+/* TODO: Lots of boilerplate. See if I can make it simpler. */
+static int shmem_deserialize_super(struct super_block *sb,
+				   struct shmem_sb_info *sbinfo)
+{
+	struct shmem_serialized_superblock *ssb;
+	const void *fdt = kho_get_fdt(), *prop;
+	char *name = sbinfo->kho_name;
+	int ret = 0, off, len;
+	struct inode *inode;
+	u64 root_ino;
+
+	if (!fdt)
+		return -ENOENT;
+
+	mutex_lock(&kho_deser_lock);
+	if (list_empty(&kho_serialized_sblist)) {
+		mutex_unlock(&kho_deser_lock);
+		return -ENOENT;
+	}
+
+	list_for_each_entry(ssb, &kho_serialized_sblist, list) {
+		if (!strcmp(ssb->name, name))
+			break;
+	}
+
+	/* Not found. */
+	if (list_entry_is_head(ssb, &kho_serialized_sblist, list)) {
+		mutex_unlock(&kho_deser_lock);
+		return -ENOENT;
+	}
+
+	off = ssb->nodeoff;
+	list_del(&ssb->list);
+	kfree(ssb);
+	mutex_unlock(&kho_deser_lock);
+
+	ret = fdt_node_check_compatible(fdt, off, "tmpfs-kho-super-v1");
+	if (ret) {
+		pr_err("KHO mount %s: invalid compatible\n", name);
+		return -EINVAL;
+	}
+
+	prop = fdt_getprop(fdt, off, "uid", &len);
+	if (!prop || len != sizeof(u32)) {
+		pr_err("KHO super %s: Invalid uid!\n", name);
+		return -EINVAL;
+	}
+	sbinfo->uid = KUIDT_INIT(fdt32_to_cpu(*(fdt32_t *)prop));
+
+	prop = fdt_getprop(fdt, off, "gid", &len);
+	if (!prop || len != sizeof(u32)) {
+		pr_err("KHO super %s: Invalid gid!\n", name);
+		return -EINVAL;
+	}
+	sbinfo->gid = KGIDT_INIT(fdt32_to_cpu(*(fdt32_t *)prop));
+
+	prop = fdt_getprop(fdt, off, "mode", &len);
+	if (!prop || len != sizeof(u32)) {
+		pr_err("KHO super %s: Invalid mode!\n", name);
+		return -EINVAL;
+	}
+	sbinfo->mode = fdt32_to_cpu(*(fdt32_t *)prop);
+
+	prop = fdt_getprop(fdt, off, "max-blocks", &len);
+	if (!prop || len != sizeof(u64)) {
+		pr_err("KHO super %s: Invalid max-blocks!\n", name);
+		return -EINVAL;
+	}
+	sbinfo->max_blocks = fdt64_to_cpu(*(fdt64_t *)prop);
+
+	prop = fdt_getprop(fdt, off, "max-inodes", &len);
+	if (!prop || len != sizeof(u64)) {
+		pr_err("KHO super %s: Invalid max-inodes!\n", name);
+		return -EINVAL;
+	}
+	sbinfo->max_inodes = fdt64_to_cpu(*(fdt64_t *)prop);
+
+	prop = fdt_getprop(fdt, off, "free-ispace", &len);
+	if (!prop || len != sizeof(u64)) {
+		pr_err("KHO super %s: Invalid free-ispace!\n", name);
+		return -EINVAL;
+	}
+	sbinfo->free_ispace = fdt64_to_cpu(*(fdt64_t *)prop);
+
+	prop = fdt_getprop(fdt, off, "flags", &len);
+	if (!prop || len != sizeof(u64)) {
+		pr_err("KHO super %s: Invalid flags!\n", name);
+		return -EINVAL;
+	}
+	sb->s_flags = fdt64_to_cpu(*(fdt64_t *)prop);
+
+	prop = fdt_getprop(fdt, off, "root", &len);
+	if (!prop || len != sizeof(u64)) {
+		pr_err("KHO super %s: Invalid root inode number!\n", name);
+		return -EINVAL;
+	}
+
+	root_ino = fdt64_to_cpu(*(fdt64_t *)prop);
+	sbinfo->noswap = true;
+
+	/* Set up the root inode. */
+	sbinfo->kho_deser = true;
+	inode = shmem_get_kho_inode(&nop_mnt_idmap, sb, NULL, VM_NORESERVE,
+				    root_ino);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+
+	sb->s_root = d_make_root(inode);
+	if (!sb->s_root)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static int shmem_deserialize_common(const void *fdt)
+{
+	struct shmem_serialized_superblock *ssb, *tmp;
+	int ret = 0, off, node, subnode, len, i;
+	/* TODO: Maybe choose a better name? */
+	const char path[] = "/tmpfs";
+	const struct kho_mem *mems;
+
+	off = fdt_path_offset(fdt, path);
+	if (off < 0) {
+		pr_debug("Found no TMPFS KHO mounts to recover.\n");
+		return 0;
+	}
+
+	ret = fdt_node_check_compatible(fdt, off, "tmpfs-kho-v1");
+	if (ret) {
+		pr_err("Unknown comatibile for TMPFS KHO mount\n");
+		return -EINVAL;
+	}
+
+	mems = fdt_getprop(fdt, off, "mem", &len);
+	if (mems) {
+		/* TODO: Total RAM pages might be different on this boot? */
+		kho_pfn_bitmap = bitmap_kvzalloc(totalram_pages(), GFP_KERNEL);
+		if (!kho_pfn_bitmap)
+			return -ENOMEM;
+		kho_pfn_nbits = totalram_pages();
+
+		for (i = 0; i < len / sizeof(struct kho_mem); i++) {
+			WARN_ON_ONCE(mems[i].len != PAGE_SIZE);
+			bitmap_set(kho_pfn_bitmap, PHYS_PFN(mems[i].addr), 1);
+			kho_claim_mem(&mems[i]);
+		}
+	}
+
+	node = fdt_subnode_offset(fdt, off, "inodes");
+	if (node < 0) {
+		/* TODO: Free previous claimed memory. */
+		pr_err("Inode cache not found!");
+		return -EINVAL;
+	}
+
+	ret = kho_deserialize_simple_slab(fdt, node, &kho_inode_cache);
+	if (ret)
+		return ret;
+
+	node = fdt_subnode_offset(fdt, off, "supers");
+	if (node < 0) {
+		/* TODO: Free inode and pages. */
+		pr_err("No superblocks found!\n");
+		return -EINVAL;
+	}
+
+	fdt_for_each_subnode(subnode, fdt, node) {
+		ssb = kmalloc(sizeof(*ssb), GFP_KERNEL);
+		if (!ssb) {
+			ret = -ENOMEM;
+			goto err;
+		}
+
+		INIT_LIST_HEAD(&ssb->list);
+		ssb->name = fdt_get_name(fdt, subnode, NULL);
+		ssb->nodeoff = subnode;
+		list_add_tail(&ssb->list, &kho_serialized_sblist);
+	}
+
+	return 0;
+
+err:
+	list_for_each_entry_safe(ssb, tmp, &kho_serialized_sblist, list) {
+		list_del(&ssb->list);
+		kfree(ssb);
+	}
+
+	return ret;
+}
+
+static int shmem_serialize_super(struct super_block *sb, void *arg)
+{
+	struct shmem_sb_info *sbinfo = SHMEM_SB(sb);
+	char compatible[] = "tmpfs-kho-super-v1";
+	void *fdt = arg;
+	int ret = 0;
+
+	if (!sbinfo->kho)
+		return 0;
+
+	ret |= fdt_begin_node(fdt, sbinfo->kho_name);
+	ret |= fdt_property_string(fdt, "compatible", compatible);
+	ret |= fdt_property_u32(fdt, "uid", __kuid_val(sbinfo->uid));
+	ret |= fdt_property_u32(fdt, "gid", __kgid_val(sbinfo->gid));
+	ret |= fdt_property_u32(fdt, "mode", sbinfo->mode);
+	/* TODO: See which properties I don't need. */
+	ret |= fdt_property_u64(fdt, "max-blocks", sbinfo->max_blocks);
+	ret |= fdt_property_u64(fdt, "max-inodes", sbinfo->max_inodes);
+	ret |= fdt_property_u64(fdt, "free-ispace", sbinfo->free_ispace);
+
+	/* State from generic in-core superblock. */
+	/*
+	 * TODO: Probably should look if I need this, and especially if I
+	 * should trim some flags out like the kernel-internal ones.
+	 */
+	ret |= fdt_property_u64(fdt, "flags", sb->s_flags);
+	ret |= fdt_property_u64(fdt, "root", sb->s_root->d_inode->i_ino);
+	ret |= fdt_end_node(fdt);
+
+	if (ret) {
+		pr_err("Failed to serialize superblock %s\n", sbinfo->kho_name);
+		return ret;
+	}
+
+	/* /\* TODO: Do I need to bump usage count of superblock? *\/ */
+	/* ret = freeze_super_locked(sb, FREEZE_HOLDER_KERNEL); */
+	/* if (ret) { */
+	/* 	pr_err("Failed to freeze superblock %s\n", sbinfo->kho_name); */
+	/* 	return ret; */
+	/* } */
+
+	return 0;
+}
+
+static int shmem_thaw_super(struct super_block *sb, void *arg)
+{
+	struct shmem_sb_info *sbinfo = SHMEM_SB(sb);
+	int ret;
+
+	if (!sbinfo->kho)
+		return 0;
+
+	/*
+	 * TODO: This is racy. Should probably track which superblocks we froze
+	 * in the first place.
+	 */
+	if (sb->s_writers.frozen != SB_FREEZE_COMPLETE)
+		return 0;
+
+	ret = thaw_super_locked(sb, FREEZE_HOLDER_KERNEL);
+	if (ret) {
+		pr_err("Failed to thaw superblock %s\n", sbinfo->kho_name);
+		return ret;
+	}
+
+	return 0;
+}
+
+static void shmem_thaw_super_noerr(struct super_block *sb, void *arg)
+{
+	shmem_thaw_super(sb, arg);
+}
+
+static int shmem_serialize_supers(void *fdt)
+{
+	int ret;
+
+	ret = iterate_supers_type_err(&shmem_fs_type, true, shmem_serialize_super,
+				      fdt);
+	if (ret) {
+		iterate_supers_type_excl(&shmem_fs_type, shmem_thaw_super_noerr,
+					 NULL);
+		return ret;
+	}
+
+	return 0;
+}
+
+/* TODO: Parallel serialize can be racy? */
+static int shmem_kho_serialize(struct notifier_block *self, unsigned long cmd,
+			       void *v)
+{
+	static const char compatible[] = "tmpfs-kho-v1";
+	struct kho_mem *mems, *cur;
+	unsigned long size, bit;
+	void *fdt = v;
+	int ret = 0;
+
+	switch(cmd) {
+	case KEXEC_KHO_ABORT:
+		iterate_supers_type(&shmem_fs_type, shmem_thaw_super_noerr,
+				    NULL);
+		/* TODO: Cleanup fdt? */
+		return NOTIFY_DONE;
+	case KEXEC_KHO_DUMP:
+		ret |= fdt_begin_node(fdt, "tmpfs");
+		ret |= fdt_property(fdt, "compatible", compatible, sizeof(compatible));
+
+		if (ret) {
+			pr_err("Failed to start tmpfs FDT node\n");
+			return NOTIFY_BAD;
+		}
+
+		/*
+		 * TODO: Freeze supers before doing this and inodes
+		 * serialization, otherwise it might be racy.
+		 */
+		size = bitmap_weight(kho_pfn_bitmap, kho_pfn_nbits) *
+			sizeof(struct kho_mem);
+		if (size) {
+			mems = kvmalloc(size, GFP_KERNEL);
+			if (!mems)
+				return NOTIFY_BAD;
+
+			cur = mems;
+
+			/*
+			 * TODO: Obviously, wastes a lot of memory. That to in
+			 * the FDT. Should come up with a better scheme.
+			 */
+			for_each_set_bit(bit, kho_pfn_bitmap, kho_pfn_nbits) {
+				cur->addr = PFN_PHYS(bit);
+				cur->len = PAGE_SIZE;
+				cur++;
+			}
+
+			ret = fdt_property(fdt, "mem", mems, size);
+			if (ret) {
+				pr_err("Failed to add main memory region to FDT\n");
+				kvfree(mems);
+				return NOTIFY_BAD;
+			}
+
+			kvfree(mems);
+		}
+
+		ret = kho_serialize_simple_slab(fdt, &kho_inode_cache,
+						"inodes");
+		if (ret)
+			return NOTIFY_BAD;
+
+		ret |= fdt_begin_node(fdt, "supers");
+		ret |= shmem_serialize_supers(fdt);
+		if (ret) {
+			pr_err("Failed to serialize all KHO superblocks!\n");
+			return NOTIFY_BAD;
+		}
+		ret |= fdt_end_node(fdt);
+
+		ret |= fdt_end_node(fdt);
+		if (ret) {
+			printk("Failed to close node!");
+			return NOTIFY_BAD;
+		}
+
+		return NOTIFY_DONE;
+	}
+
+	return 0;
+}
+
+static struct notifier_block shmem_kho_nb = {
+	.notifier_call = shmem_kho_serialize,
+};
+
 static void shmem_put_super(struct super_block *sb)
 {
 	struct shmem_sb_info *sbinfo = SHMEM_SB(sb);
@@ -4701,6 +5280,8 @@ static void shmem_put_super(struct super_block *sb)
 	free_percpu(sbinfo->ino_batch);
 	percpu_counter_destroy(&sbinfo->used_blocks);
 	mpol_put(sbinfo->mpol);
+	if (sbinfo->kho)
+		kfree(sbinfo->kho_name);
 	kfree(sbinfo);
 	sb->s_fs_info = NULL;
 }
@@ -4776,6 +5357,36 @@ static int shmem_fill_super(struct super_block *sb, struct fs_context *fc)
 #ifdef CONFIG_TMPFS_POSIX_ACL
 	sb->s_flags |= SB_POSIXACL;
 #endif
+
+	/* TODO: Fix this super ugly logic. */
+	if (ctx->kho) {
+		/*
+		 * First KHO mounts allocates this bitmap. If no KHO mount is
+		 * ever used, there is no point in having this.
+		 */
+		if (!kho_pfn_bitmap) {
+			/* TODO: Does not account for memory hotplug. */
+			kho_pfn_bitmap = bitmap_kvzalloc(totalram_pages(),
+							 GFP_KERNEL);
+			if (!kho_pfn_bitmap) {
+				error = -ENOMEM;
+				goto failed;
+			}
+			/* TODO: Racy if memory hotplug. */
+			kho_pfn_nbits = totalram_pages();
+		}
+
+		sbinfo->kho = true;
+		WARN_ON(!ctx->kho_name);
+		sbinfo->kho_name = ctx->kho_name;
+
+		error = shmem_deserialize_super(sb, sbinfo);
+		if (error && error != -ENOENT)
+			goto failed;
+		else if (!error)
+			return 0;
+	}
+
 	uuid_t uuid;
 	uuid_gen(&uuid);
 	super_set_uuid(sb, uuid.b, sizeof(uuid));
@@ -4843,6 +5454,7 @@ static struct kmem_cache *shmem_inode_cachep __ro_after_init;
 static struct inode *shmem_alloc_inode(struct super_block *sb)
 {
 	struct shmem_inode_info *info;
+
 	info = alloc_inode_sb(sb, shmem_inode_cachep, GFP_KERNEL);
 	if (!info)
 		return NULL;
@@ -4853,6 +5465,15 @@ static void shmem_free_in_core_inode(struct inode *inode)
 {
 	if (S_ISLNK(inode->i_mode))
 		kfree(inode->i_link);
+	/*
+	 * TODO: The lifecycle of the kho_inode is a bit weird. It gets
+	 * allocated in shmem_get_inode() and gets freed here. Perhaps would
+	 * make sense to allocate in shmem_alloc_inode() or free in
+	 * shmem_evict_inode()? Could also keep same since shmem_get_inode() and
+	 * shmem_alloc_inode() are tied together anyway.
+	 */
+	if (SHMEM_I(inode)->kho_inode)
+		free_simple_slab(&kho_inode_cache, SHMEM_I(inode)->kho_inode);
 	kmem_cache_free(shmem_inode_cachep, SHMEM_I(inode));
 }
 
@@ -4875,6 +5496,7 @@ static void __init shmem_init_inodecache(void)
 	shmem_inode_cachep = kmem_cache_create("shmem_inode_cache",
 				sizeof(struct shmem_inode_info),
 				0, SLAB_PANIC|SLAB_ACCOUNT, shmem_init_inode);
+	init_simple_slab(&kho_inode_cache, sizeof(struct shmem_kho_inode));
 }
 
 static void __init shmem_destroy_inodecache(void)
@@ -5033,6 +5655,7 @@ static struct file_system_type shmem_fs_type = {
 
 void __init shmem_init(void)
 {
+	const void *fdt;
 	int error;
 
 	shmem_init_inodecache();
@@ -5056,6 +5679,26 @@ void __init shmem_init(void)
 		error = PTR_ERR(shm_mnt);
 		pr_err("Could not kern_mount tmpfs\n");
 		goto out1;
+	}
+
+	/* TODO: Wrap in ifdef */
+	mutex_init(&kho_deser_lock);
+	INIT_LIST_HEAD(&kho_serialized_sblist);
+	fdt = kho_get_fdt();
+	if (fdt) {
+		/*
+		 * Deserialize common bits now. The superblocks get
+		 * deserialized on-demand later when they are mounted.
+		 */
+		error = shmem_deserialize_common(fdt);
+		if (error)
+			pr_err("Failed to deserialize common data for KHO mounts. They will not work!\n");
+	}
+	error = register_kho_notifier(&shmem_kho_nb);
+	if (error) {
+		pr_err("Failed to register KHO notifier. KHO mounts won't persist!");
+		/* TODO: Make KHO mounts fail after this? */
+		error = 0;
 	}
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
