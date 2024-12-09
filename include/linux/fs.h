@@ -2576,7 +2576,9 @@ extern int vfs_statfs(const struct path *, struct kstatfs *);
 extern int user_statfs(const char __user *, struct kstatfs *);
 extern int fd_statfs(int, struct kstatfs *);
 int freeze_super(struct super_block *super, enum freeze_holder who);
+int freeze_super_locked(struct super_block *super, enum freeze_holder who);
 int thaw_super(struct super_block *super, enum freeze_holder who);
+int thaw_super_locked(struct super_block *super, enum freeze_holder who);
 extern __printf(2, 3)
 int super_setup_bdi_name(struct super_block *sb, char *fmt, ...);
 extern int super_setup_bdi(struct super_block *sb);

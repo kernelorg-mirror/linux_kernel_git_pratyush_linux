@@ -39,8 +39,6 @@
 #include <uapi/linux/mount.h>
 #include "internal.h"
 
-static int thaw_super_locked(struct super_block *sb, enum freeze_holder who);
-
 static LIST_HEAD(super_blocks);
 static DEFINE_SPINLOCK(sb_lock);
 
@@ -1984,69 +1982,10 @@ static inline bool may_freeze(struct super_block *sb, enum freeze_holder who)
 	return false;
 }
 
-/**
- * freeze_super - lock the filesystem and force it into a consistent state
- * @sb: the super to lock
- * @who: context that wants to freeze
- *
- * Syncs the super to make sure the filesystem is consistent and calls the fs's
- * freeze_fs.  Subsequent calls to this without first thawing the fs may return
- * -EBUSY.
- *
- * @who should be:
- * * %FREEZE_HOLDER_USERSPACE if userspace wants to freeze the fs;
- * * %FREEZE_HOLDER_KERNEL if the kernel wants to freeze the fs.
- * * %FREEZE_MAY_NEST whether nesting freeze and thaw requests is allowed.
- *
- * The @who argument distinguishes between the kernel and userspace trying to
- * freeze the filesystem.  Although there cannot be multiple kernel freezes or
- * multiple userspace freezes in effect at any given time, the kernel and
- * userspace can both hold a filesystem frozen.  The filesystem remains frozen
- * until there are no kernel or userspace freezes in effect.
- *
- * A filesystem may hold multiple devices and thus a filesystems may be
- * frozen through the block layer via multiple block devices. In this
- * case the request is marked as being allowed to nest by passing
- * FREEZE_MAY_NEST. The filesystem remains frozen until all block
- * devices are unfrozen. If multiple freezes are attempted without
- * FREEZE_MAY_NEST -EBUSY will be returned.
- *
- * During this function, sb->s_writers.frozen goes through these values:
- *
- * SB_UNFROZEN: File system is normal, all writes progress as usual.
- *
- * SB_FREEZE_WRITE: The file system is in the process of being frozen.  New
- * writes should be blocked, though page faults are still allowed. We wait for
- * all writes to complete and then proceed to the next stage.
- *
- * SB_FREEZE_PAGEFAULT: Freezing continues. Now also page faults are blocked
- * but internal fs threads can still modify the filesystem (although they
- * should not dirty new pages or inodes), writeback can run etc. After waiting
- * for all running page faults we sync the filesystem which will clean all
- * dirty pages and inodes (no new dirty pages or inodes can be created when
- * sync is running).
- *
- * SB_FREEZE_FS: The file system is frozen. Now all internal sources of fs
- * modification are blocked (e.g. XFS preallocation truncation on inode
- * reclaim). This is usually implemented by blocking new transactions for
- * filesystems that have them and need this additional guard. After all
- * internal writers are finished we call ->freeze_fs() to finish filesystem
- * freezing. Then we transition to SB_FREEZE_COMPLETE state. This state is
- * mostly auxiliary for filesystems to verify they do not modify frozen fs.
- *
- * sb->s_writers.frozen is protected by sb->s_umount.
- *
- * Return: If the freeze was successful zero is returned. If the freeze
- *         failed a negative error code is returned.
- */
-int freeze_super(struct super_block *sb, enum freeze_holder who)
+int freeze_super_locked(struct super_block *sb, enum freeze_holder who)
 {
 	int ret;
 
-	if (!super_lock_excl(sb)) {
-		WARN_ON_ONCE("Dying superblock while freezing!");
-		return -EINVAL;
-	}
 	atomic_inc(&sb->s_active);
 
 retry:
@@ -2126,6 +2065,71 @@ retry:
 	super_unlock_excl(sb);
 	return 0;
 }
+EXPORT_SYMBOL(freeze_super_locked);
+
+/**
+ * freeze_super - lock the filesystem and force it into a consistent state
+ * @sb: the super to lock
+ * @who: context that wants to freeze
+ *
+ * Syncs the super to make sure the filesystem is consistent and calls the fs's
+ * freeze_fs.  Subsequent calls to this without first thawing the fs may return
+ * -EBUSY.
+ *
+ * @who should be:
+ * * %FREEZE_HOLDER_USERSPACE if userspace wants to freeze the fs;
+ * * %FREEZE_HOLDER_KERNEL if the kernel wants to freeze the fs.
+ * * %FREEZE_MAY_NEST whether nesting freeze and thaw requests is allowed.
+ *
+ * The @who argument distinguishes between the kernel and userspace trying to
+ * freeze the filesystem.  Although there cannot be multiple kernel freezes or
+ * multiple userspace freezes in effect at any given time, the kernel and
+ * userspace can both hold a filesystem frozen.  The filesystem remains frozen
+ * until there are no kernel or userspace freezes in effect.
+ *
+ * A filesystem may hold multiple devices and thus a filesystems may be
+ * frozen through the block layer via multiple block devices. In this
+ * case the request is marked as being allowed to nest by passing
+ * FREEZE_MAY_NEST. The filesystem remains frozen until all block
+ * devices are unfrozen. If multiple freezes are attempted without
+ * FREEZE_MAY_NEST -EBUSY will be returned.
+ *
+ * During this function, sb->s_writers.frozen goes through these values:
+ *
+ * SB_UNFROZEN: File system is normal, all writes progress as usual.
+ *
+ * SB_FREEZE_WRITE: The file system is in the process of being frozen.  New
+ * writes should be blocked, though page faults are still allowed. We wait for
+ * all writes to complete and then proceed to the next stage.
+ *
+ * SB_FREEZE_PAGEFAULT: Freezing continues. Now also page faults are blocked
+ * but internal fs threads can still modify the filesystem (although they
+ * should not dirty new pages or inodes), writeback can run etc. After waiting
+ * for all running page faults we sync the filesystem which will clean all
+ * dirty pages and inodes (no new dirty pages or inodes can be created when
+ * sync is running).
+ *
+ * SB_FREEZE_FS: The file system is frozen. Now all internal sources of fs
+ * modification are blocked (e.g. XFS preallocation truncation on inode
+ * reclaim). This is usually implemented by blocking new transactions for
+ * filesystems that have them and need this additional guard. After all
+ * internal writers are finished we call ->freeze_fs() to finish filesystem
+ * freezing. Then we transition to SB_FREEZE_COMPLETE state. This state is
+ * mostly auxiliary for filesystems to verify they do not modify frozen fs.
+ *
+ * sb->s_writers.frozen is protected by sb->s_umount.
+ *
+ * Return: If the freeze was successful zero is returned. If the freeze
+ *         failed a negative error code is returned.
+ */
+int freeze_super(struct super_block *sb, enum freeze_holder who)
+{
+	if (!super_lock_excl(sb)) {
+		WARN_ON_ONCE("Dying superblock while freezing!");
+		return -EINVAL;
+	}
+	return freeze_super_locked(sb, who);
+}
 EXPORT_SYMBOL(freeze_super);
 
 /*
@@ -2134,7 +2138,7 @@ EXPORT_SYMBOL(freeze_super);
  * removes that state without releasing the other state or unlocking the
  * filesystem.
  */
-static int thaw_super_locked(struct super_block *sb, enum freeze_holder who)
+int thaw_super_locked(struct super_block *sb, enum freeze_holder who)
 {
 	int error = -EINVAL;
 
@@ -2177,6 +2181,7 @@ out_unlock:
 	super_unlock_excl(sb);
 	return error;
 }
+EXPORT_SYMBOL(thaw_super_locked);
 
 /**
  * thaw_super -- unlock filesystem
