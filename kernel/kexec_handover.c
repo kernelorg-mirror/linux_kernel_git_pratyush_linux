@@ -605,6 +605,7 @@ struct kho_out kho_out = {
 		},
 	},
 	.finalized = false,
+	.aborting = false,
 };
 
 int register_kho_notifier(struct notifier_block *nb)
@@ -657,7 +658,7 @@ int kho_unpreserve_folio(struct folio *folio)
 	const unsigned int order = folio_order(folio);
 	struct kho_mem_track *track = &kho_out.ser.track;
 
-	if (kho_out.finalized)
+	if (kho_out.finalized && !kho_out.aborting)
 		return -EBUSY;
 
 	__kho_unpreserve_order(track, pfn, order);
@@ -731,7 +732,7 @@ int kho_unpreserve_phys(phys_addr_t phys, size_t size)
 	unsigned long pfn = PHYS_PFN(phys);
 	unsigned long end_pfn = PHYS_PFN(phys + size);
 
-	if (kho_out.finalized)
+	if (kho_out.finalized && !kho_out.aborting)
 		return -EBUSY;
 
 	if (!PAGE_ALIGNED(phys) || !PAGE_ALIGNED(size))
@@ -746,29 +747,17 @@ EXPORT_SYMBOL_GPL(kho_unpreserve_phys);
 int __kho_abort(void)
 {
 	int err;
-	unsigned long order;
-	struct kho_mem_phys *physxa;
-
-	xa_for_each(&kho_out.ser.track.orders, order, physxa) {
-		struct kho_mem_phys_bits *bits;
-		unsigned long phys;
-
-		xa_for_each(&physxa->phys_bits, phys, bits)
-			kfree(bits);
-
-		xa_destroy(&physxa->phys_bits);
-		kfree(physxa);
-	}
-	xa_destroy(&kho_out.ser.track.orders);
 
 	if (kho_out.ser.preserved_mem_map) {
 		kho_mem_ser_free(kho_out.ser.preserved_mem_map);
 		kho_out.ser.preserved_mem_map = NULL;
 	}
 
+	kho_out.aborting = true;
 	err = blocking_notifier_call_chain(&kho_out.chain_head, KEXEC_KHO_ABORT,
 					   NULL);
 	err = notifier_to_errno(err);
+	kho_out.aborting = false;
 
 	if (err)
 		pr_err("Failed to abort KHO finalization: %d\n", err);
