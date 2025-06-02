@@ -40,6 +40,7 @@ struct kho_out {
 	struct mutex lock; /* protects KHO FDT finalization */
 	struct kho_serialization ser;
 	bool finalized;
+	bool aborting;
 #ifdef CONFIG_KEXEC_HANDOVER_DEBUG
 	struct dentry *dir;
 #endif
