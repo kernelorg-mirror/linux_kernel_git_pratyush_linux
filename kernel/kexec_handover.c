@@ -809,6 +809,7 @@ abort:
 	if (err) {
 		pr_err("Failed to convert KHO state tree: %d\n", err);
 		__kho_abort();
+		kho_out_update_debugfs_fdt();
 	}
 
 	return err;
