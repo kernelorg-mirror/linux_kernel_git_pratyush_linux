@@ -14,8 +14,9 @@
 #include <linux/libfdt.h>
 #include <linux/mm.h>
 #include "kexec_handover_internal.h"
+#include "luo_internal.h"
 
-static struct dentry *debugfs_root;
+struct dentry *liveupdate_debugfs_root;
 
 struct fdt_debugfs {
 	struct list_head list;
@@ -141,7 +142,7 @@ __init void kho_in_debugfs_init(const void *fdt)
 	struct dentry *sub_fdt_dir;
 	int err, child;
 
-	kho_in.dir = debugfs_create_dir("in", debugfs_root);
+	kho_in.dir = debugfs_create_dir("kho_in", liveupdate_debugfs_root);
 	if (IS_ERR(kho_in.dir)) {
 		err = PTR_ERR(kho_in.dir);
 		goto err_out;
@@ -196,7 +197,7 @@ __init int kho_out_debugfs_init(void)
 {
 	struct dentry *dir, *f, *sub_fdt_dir;
 
-	dir = debugfs_create_dir("out", debugfs_root);
+	dir = debugfs_create_dir("kho_out", liveupdate_debugfs_root);
 	if (IS_ERR(dir))
 		return -ENOMEM;
 
@@ -230,8 +231,8 @@ err_rmdir:
 
 __init int kho_debugfs_init(void)
 {
-	debugfs_root = debugfs_create_dir("kho", NULL);
-	if (IS_ERR(debugfs_root))
+	liveupdate_debugfs_root = debugfs_create_dir("liveupdate", NULL);
+	if (IS_ERR(liveupdate_debugfs_root))
 		return -ENOENT;
 	return 0;
 }
