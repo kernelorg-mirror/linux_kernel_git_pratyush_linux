@@ -16,14 +16,21 @@
 #include <linux/libfdt.h>
 #include <linux/liveupdate.h>
 #include <linux/kexec_handover.h>
+#include <linux/kho_array.h>
 #include <linux/shmem_fs.h>
 #include <linux/bits.h>
 #include "internal.h"
 
 static const char memfd_luo_compatible[] = "memfd-v1";
 
-#define PRESERVED_PFN_MASK		GENMASK(63, 12)
-#define PRESERVED_PFN_SHIFT		12
+/*
+ * The preserved folio descriptor is made of 2 parts. The bottom 11 bits are
+ * used for storing flags, the others for storing the PFN. 11 bits are used
+ * instead of 12 since we are going to store it in struct kho_array as a value,
+ * and that only accepts values up to LONG_MAX.
+ */
+#define PRESERVED_PFN_SHIFT		11
+#define PRESERVED_PFN_MASK		GENMASK(63, PRESERVED_PFN_SHIFT)
 #define PRESERVED_FLAG_DIRTY		BIT(0)
 #define PRESERVED_FLAG_UPTODATE		BIT(1)
 
@@ -31,27 +38,23 @@ static const char memfd_luo_compatible[] = "memfd-v1";
 #define PRESERVED_FOLIO_FLAGS(desc)	((desc) & ~PRESERVED_PFN_MASK)
 #define PRESERVED_FOLIO_MKDESC(pfn, flags) (((pfn) << PRESERVED_PFN_SHIFT) | (flags))
 
-struct memfd_luo_preserved_folio {
-	/*
-	 * The folio descriptor is made of 2 parts. The bottom 12 bits are used
-	 * for storing flags, the others for storing the PFN.
-	 */
-	u64 foliodesc;
-	u64 index;
-};
-
-static int memfd_luo_preserve_folios(struct memfd_luo_preserved_folio *pfolios,
+static int memfd_luo_preserve_folios(struct kho_array *ka,
 				     struct folio **folios,
 				     unsigned int nr_folios)
 {
+	struct ka_iter iter;
 	int err;
 	long i;
 
+	ka_iter_init_write(&iter, ka);
+
 	for (i = 0; i < nr_folios; i++) {
-		struct memfd_luo_preserved_folio *pfolio = &pfolios[i];
 		struct folio *folio = folios[i];
 		unsigned int flags = 0;
 		unsigned long pfn;
+
+		if (ka_iter_setpos(&iter, folio->index))
+			goto err_unpreserve;
 
 		err = kho_preserve_folio(folio);
 		if (err)
@@ -63,9 +66,16 @@ static int memfd_luo_preserve_folios(struct memfd_luo_preserved_folio *pfolios,
 		if (folio_test_uptodate(folio))
 			flags |= PRESERVED_FLAG_UPTODATE;
 
-		pfolio->foliodesc = PRESERVED_FOLIO_MKDESC(pfn, flags);
-		pfolio->index = folio->index;
+		err = ka_iter_setentry(&iter, ka_mk_value(PRESERVED_FOLIO_MKDESC(pfn, flags)));
+		if (err) {
+			WARN_ON_ONCE(kho_unpreserve_folio(folio));
+			goto err_unpreserve;
+		}
 	}
+
+	err = kho_array_preserve(ka);
+	if (err)
+		goto err_unpreserve;
 
 	return 0;
 
@@ -73,45 +83,44 @@ err_unpreserve:
 	i--;
 	for (; i >= 0; i--)
 		WARN_ON_ONCE(kho_unpreserve_folio(folios[i]));
+
+	kho_array_destroy(ka);
 	return err;
 }
 
-static void memfd_luo_unpreserve_folios(const struct memfd_luo_preserved_folio *pfolios,
-					unsigned int nr_folios)
+static void memfd_luo_unpreserve_folios(struct kho_array *ka)
 {
-	unsigned int i;
+	struct ka_iter iter;
+	void *entry;
 
-	for (i = 0; i < nr_folios; i++) {
-		const struct memfd_luo_preserved_folio *pfolio = &pfolios[i];
+	ka_iter_init_read(&iter, ka);
+
+	ka_iter_for_each(&iter, entry) {
+		unsigned long foliodesc = ka_to_value(entry);
 		struct folio *folio;
 
-		if (!pfolio->foliodesc)
-			continue;
-
-		folio = pfn_folio(PRESERVED_FOLIO_PFN(pfolio->foliodesc));
-
+		folio = pfn_folio(PRESERVED_FOLIO_PFN(foliodesc));
 		WARN_ON_ONCE(kho_unpreserve_folio(folio));
 		unpin_folio(folio);
 	}
+
+	WARN_ON_ONCE(kho_array_unpreserve(ka));
+	kho_array_destroy(ka);
 }
 
 static void *memfd_luo_create_fdt(unsigned long size)
 {
-	unsigned int order = get_order(size);
 	struct folio *fdt_folio;
 	int err = 0;
 	void *fdt;
 
-	if (order > MAX_PAGE_ORDER)
-		return NULL;
-
-	fdt_folio = folio_alloc(GFP_KERNEL | __GFP_ZERO, order);
+	fdt_folio = folio_alloc(GFP_KERNEL | __GFP_ZERO, 0);
 	if (!fdt_folio)
 		return NULL;
 
 	fdt = folio_address(fdt_folio);
 
-	err |= fdt_create(fdt, (1 << (order + PAGE_SHIFT)));
+	err |= fdt_create(fdt, PAGE_SIZE);
 	err |= fdt_finish_reservemap(fdt);
 	err |= fdt_begin_node(fdt, "");
 	if (err)
@@ -135,16 +144,17 @@ static int memfd_luo_finish_fdt(void *fdt)
 	return fdt_finish(fdt);
 }
 
+/* TODO: Review the code after conversion to kho_array. */
 static int memfd_luo_prepare(struct liveupdate_file_handler *handler,
 			     struct file *file, u64 *data)
 {
-	struct memfd_luo_preserved_folio *preserved_folios;
 	struct inode *inode = file_inode(file);
 	unsigned int max_folios, nr_folios = 0;
-	int err = 0, preserved_size;
 	struct folio **folios;
+	struct kho_array *ka;
 	long size, nr_pinned;
 	pgoff_t offset;
+	int err = 0;
 	void *fdt;
 	u64 pos;
 
@@ -190,18 +200,7 @@ static int memfd_luo_prepare(struct liveupdate_file_handler *handler,
 	/* nr_pinned won't be more than max_folios which is also unsigned int. */
 	nr_folios = (unsigned int)nr_pinned;
 
-	preserved_size = sizeof(struct memfd_luo_preserved_folio) * nr_folios;
-	if (check_mul_overflow(sizeof(struct memfd_luo_preserved_folio),
-			       nr_folios, &preserved_size)) {
-		err = -E2BIG;
-		goto err_unpin;
-	}
-
-	/*
-	 * Most of the space should be taken by preserved folios. So take its
-	 * size, plus a page for other properties.
-	 */
-	fdt = memfd_luo_create_fdt(PAGE_ALIGN(preserved_size) + PAGE_SIZE);
+	fdt = memfd_luo_create_fdt(PAGE_SIZE);
 	if (!fdt) {
 		err = -ENOMEM;
 		goto err_unpin;
@@ -216,8 +215,7 @@ static int memfd_luo_prepare(struct liveupdate_file_handler *handler,
 	if (err)
 		goto err_free_fdt;
 
-	err = fdt_property_placeholder(fdt, "folios", preserved_size,
-				       (void **)&preserved_folios);
+	err = fdt_property_placeholder(fdt, "folios", sizeof(*ka), (void **)&ka);
 	if (err) {
 		pr_err("Failed to reserve folios property in FDT: %s\n",
 		       fdt_strerror(err));
@@ -225,7 +223,7 @@ static int memfd_luo_prepare(struct liveupdate_file_handler *handler,
 		goto err_free_fdt;
 	}
 
-	err = memfd_luo_preserve_folios(preserved_folios, folios, nr_folios);
+	err = memfd_luo_preserve_folios(ka, folios, nr_folios);
 	if (err)
 		goto err_free_fdt;
 
@@ -244,7 +242,7 @@ static int memfd_luo_prepare(struct liveupdate_file_handler *handler,
 	return 0;
 
 err_unpreserve:
-	memfd_luo_unpreserve_folios(preserved_folios, nr_folios);
+	memfd_luo_unpreserve_folios(ka);
 err_free_fdt:
 	folio_put(virt_to_folio(fdt));
 err_unpin:
@@ -284,9 +282,9 @@ static int memfd_luo_freeze(struct liveupdate_file_handler *handler,
 static void memfd_luo_cancel(struct liveupdate_file_handler *handler,
 			     struct file *file, u64 data)
 {
-	const struct memfd_luo_preserved_folio *pfolios;
 	struct inode *inode = file_inode(file);
 	struct folio *fdt_folio;
+	struct kho_array *ka;
 	void *fdt;
 	int len;
 
@@ -298,9 +296,8 @@ static void memfd_luo_cancel(struct liveupdate_file_handler *handler,
 
 	fdt = phys_to_virt(data);
 	fdt_folio = virt_to_folio(fdt);
-	pfolios = fdt_getprop(fdt, 0, "folios", &len);
-	if (pfolios)
-		memfd_luo_unpreserve_folios(pfolios, len / sizeof(*pfolios));
+	ka = (struct kho_array *)fdt_getprop(folio_address(fdt_folio), 0, "folios", &len);
+	memfd_luo_unpreserve_folios(ka);
 
 	kho_unpreserve_folio(fdt_folio);
 	folio_put(fdt_folio);
@@ -312,20 +309,25 @@ static struct folio *memfd_luo_get_fdt(u64 data)
 	return kho_restore_folio((phys_addr_t)data);
 }
 
-static void memfd_luo_discard_folios(const struct memfd_luo_preserved_folio *pfolios,
-				     unsigned int nr_folios)
+static void memfd_luo_discard_folios(struct kho_array *ka)
 {
-	unsigned int i;
+	struct ka_iter iter;
+	void *entry;
+	int err;
 
-	for (i = 0; i < nr_folios; i++) {
-		const struct memfd_luo_preserved_folio *pfolio = &pfolios[i];
+	err = kho_array_restore(ka);
+	if (err) {
+		pr_err("failed to restore 'folios' array: %d\n", err);
+		return;
+	}
+	ka_iter_init_read(&iter, ka);
+
+	ka_iter_for_each(&iter, entry) {
+		unsigned long foliodesc = ka_to_value(entry);
 		struct folio *folio;
 		phys_addr_t phys;
 
-		if (!pfolio->foliodesc)
-			continue;
-
-		phys = PFN_PHYS(PRESERVED_FOLIO_PFN(pfolio->foliodesc));
+		phys = PFN_PHYS(PRESERVED_FOLIO_PFN(foliodesc));
 		folio = kho_restore_folio(phys);
 		if (!folio) {
 			pr_warn_ratelimited("Unable to restore folio at physical address: %llx\n",
@@ -335,13 +337,15 @@ static void memfd_luo_discard_folios(const struct memfd_luo_preserved_folio *pfo
 
 		folio_put(folio);
 	}
+
+	kho_array_destroy(ka);
 }
 
 static void memfd_luo_finish(struct liveupdate_file_handler *handler,
 			     struct file *file, u64 data, bool reclaimed)
 {
-	const struct memfd_luo_preserved_folio *pfolios;
 	struct folio *fdt_folio;
+	struct kho_array *ka;
 	int len;
 
 	if (reclaimed)
@@ -349,24 +353,32 @@ static void memfd_luo_finish(struct liveupdate_file_handler *handler,
 
 	fdt_folio = memfd_luo_get_fdt(data);
 
-	pfolios = fdt_getprop(folio_address(fdt_folio), 0, "folios", &len);
-	if (pfolios)
-		memfd_luo_discard_folios(pfolios, len / sizeof(*pfolios));
+	ka = (struct kho_array *)fdt_getprop(folio_address(fdt_folio), 0, "folios", &len);
+	if (!ka || len != sizeof(*ka))
+		pr_warn("invalid 'folios' property\n");
+	else
+		memfd_luo_discard_folios(ka);
 
 	folio_put(fdt_folio);
 }
 
+/*
+ * TODO: Review the code after conversion to kho_array.
+ * Also, perhaps split this function into helpers to make it simpler?
+ */
 static int memfd_luo_retrieve(struct liveupdate_file_handler *handler, u64 data,
 			      struct file **file_p)
 {
-	const struct memfd_luo_preserved_folio *pfolios;
-	int nr_pfolios, len, ret = 0, i = 0;
 	struct address_space *mapping;
 	struct folio *folio, *fdt_folio;
 	const u64 *pos, *size;
+	struct kho_array *ka;
+	struct ka_iter iter;
 	struct inode *inode;
 	struct file *file;
+	int len, ret = 0;
 	const void *fdt;
+	void *entry;
 
 	fdt_folio = memfd_luo_get_fdt(data);
 	if (!fdt_folio)
@@ -374,13 +386,19 @@ static int memfd_luo_retrieve(struct liveupdate_file_handler *handler, u64 data,
 
 	fdt = page_to_virt(folio_page(fdt_folio, 0));
 
-	pfolios = fdt_getprop(fdt, 0, "folios", &len);
-	if (!pfolios || len % sizeof(*pfolios)) {
+	ka = (struct kho_array *)fdt_getprop(fdt, 0, "folios", &len);
+	if (!ka || len != sizeof(*ka)) {
 		pr_err("invalid 'folios' property\n");
 		ret = -EINVAL;
 		goto put_fdt;
 	}
-	nr_pfolios = len / sizeof(*pfolios);
+
+	ret = kho_array_restore(ka);
+	if (ret) {
+		pr_err("Failed to restore 'folios' array\n");
+		goto put_fdt;
+	}
+	ka_iter_init_read(&iter, ka);
 
 	size = fdt_getprop(fdt, 0, "size", &len);
 	if (!size || len != sizeof(u64)) {
@@ -408,24 +426,22 @@ static int memfd_luo_retrieve(struct liveupdate_file_handler *handler, u64 data,
 	mapping = inode->i_mapping;
 	vfs_setpos(file, *pos, MAX_LFS_FILESIZE);
 
-	for (; i < nr_pfolios; i++) {
-		const struct memfd_luo_preserved_folio *pfolio = &pfolios[i];
+	ka_iter_for_each(&iter, entry) {
+		unsigned long foliodesc = ka_to_value(entry);
 		phys_addr_t phys;
 		u64 index;
 		int flags;
 
-		if (!pfolio->foliodesc)
-			continue;
+		phys = PFN_PHYS(PRESERVED_FOLIO_PFN(foliodesc));
 
-		phys = PFN_PHYS(PRESERVED_FOLIO_PFN(pfolio->foliodesc));
 		folio = kho_restore_folio(phys);
 		if (!folio) {
 			pr_err("Unable to restore folio at physical address: %llx\n",
 			       phys);
 			goto put_file;
 		}
-		index = pfolio->index;
-		flags = PRESERVED_FOLIO_FLAGS(pfolio->foliodesc);
+		index = ka_iter_getpos(&iter);
+		flags = PRESERVED_FOLIO_FLAGS(foliodesc);
 
 		/* Set up the folio for insertion. */
 		__folio_set_locked(folio);
@@ -433,16 +449,16 @@ static int memfd_luo_retrieve(struct liveupdate_file_handler *handler, u64 data,
 
 		ret = mem_cgroup_charge(folio, NULL, mapping_gfp_mask(mapping));
 		if (ret) {
-			pr_err("shmem: failed to charge folio index %d: %d\n",
-			       i, ret);
+			pr_err("shmem: failed to charge folio index %ld: %d\n",
+			       ka_iter_getpos(&iter), ret);
 			goto unlock_folio;
 		}
 
 		ret = shmem_add_to_page_cache(folio, mapping, index, NULL,
 					      mapping_gfp_mask(mapping));
 		if (ret) {
-			pr_err("shmem: failed to add to page cache folio index %d: %d\n",
-			       i, ret);
+			pr_err("shmem: failed to add to page cache folio index %ld: %d\n",
+			       ka_iter_getpos(&iter), ret);
 			goto unlock_folio;
 		}
 
@@ -453,19 +469,26 @@ static int memfd_luo_retrieve(struct liveupdate_file_handler *handler, u64 data,
 
 		ret = shmem_inode_acct_blocks(inode, 1);
 		if (ret) {
-			pr_err("shmem: failed to account folio index %d: %d\n",
-			       i, ret);
+			pr_err("shmem: failed to account folio index %ld: %d\n",
+			       ka_iter_getpos(&iter), ret);
 			goto unlock_folio;
 		}
 
 		shmem_recalc_inode(inode, 1, 0);
 		folio_add_lru(folio);
+
+		/*
+		 * shmem_add_to_page_cache() takes a ref on the folio and locks
+		 * it because usually the caller intends to use the folio. We
+		 * don't, so drop the ref and lock.
+		 */
 		folio_unlock(folio);
 		folio_put(folio);
 	}
 
 	inode->i_size = *size;
 	*file_p = file;
+	kho_array_destroy(ka);
 	folio_put(fdt_folio);
 	return 0;
 
@@ -474,16 +497,17 @@ unlock_folio:
 	folio_put(folio);
 put_file:
 	fput(file);
-	i++;
+	ka_iter_nextentry(&iter);
 put_folios:
-	for (; i < nr_pfolios; i++) {
-		const struct memfd_luo_preserved_folio *pfolio = &pfolios[i];
+	ka_iter_for_each(&iter, entry) {
+		unsigned long foliodesc = ka_to_value(entry);
 
-		folio = kho_restore_folio(PRESERVED_FOLIO_PFN(pfolio->foliodesc));
+		folio = kho_restore_folio(PRESERVED_FOLIO_PFN(foliodesc));
 		if (folio)
 			folio_put(folio);
 	}
 
+	kho_array_destroy(ka);
 put_fdt:
 	folio_put(fdt_folio);
 	return ret;
